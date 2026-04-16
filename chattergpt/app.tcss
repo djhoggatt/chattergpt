@@ -1,0 +1,79 @@
+Screen {
+    layout: horizontal;
+    background: transparent;
+    color: $text;
+}
+
+Header {
+    background: transparent;
+}
+
+Footer {
+    background: transparent;
+}
+
+Label {
+    background: transparent;
+}
+
+ListView {
+    background: transparent;
+}
+
+ListItem {
+    background: transparent;
+}
+
+.sidebar-selected {
+    background: $accent 40%;
+    color: $text;
+    text-style: bold;
+}
+
+.sidebar-section {
+    text-style: bold;
+    color: $text-muted;
+}
+
+#sidebar {
+    width: 28;
+    border: solid $accent;
+    dock: left;
+    background: transparent;
+}
+
+#sidebar-title {
+    padding: 1 2;
+    text-style: bold;
+    background: transparent;
+}
+
+#sidebar-list {
+    height: 1fr;
+    background: transparent;
+}
+
+#main {
+    layout: vertical;
+    width: 1fr;
+    background: transparent;
+}
+
+#chat-history {
+    height: 1fr;
+    border: solid $success;
+    background: transparent;
+}
+
+#composer {
+    height: 8;
+    border: solid $accent-lighten-2;
+    background: transparent;
+}
+
+#status {
+    height: 1;
+    color: $text-muted;
+    padding: 0 1;
+    background: transparent;
+}

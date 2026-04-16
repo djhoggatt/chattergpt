@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chattergpt"
+version = "0.1.0"
+description = "A terminal UI for ChatGPT backed by browser automation."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "playwright>=1.54.0",
+  "textual>=0.73.0",
+]
+
+[project.scripts]
+chattergpt = "chattergpt.app:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["chattergpt*"]
+
+[tool.setuptools.package-data]
+chattergpt = ["*.tcss"]

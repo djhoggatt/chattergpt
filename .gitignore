@@ -1,0 +1,5 @@
+build
+chattergpt.egg-info
+chattergpt/__pycache__/
+chattergpt/backend/__pycache__/
+chattergpt/widgets/__pycache__/
