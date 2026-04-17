@@ -7,11 +7,20 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
+import re
 
 from playwright.async_api import Browser, BrowserContext, Error, Page, TimeoutError, async_playwright
 
 from chattergpt.config import BrowserTarget, Settings
-from chattergpt.models import AuthState, BackendStatus, ConversationData, ConversationSummary, Message, StreamEvent
+from chattergpt.models import (
+    AuthState,
+    BackendStatus,
+    ConversationData,
+    ConversationSummary,
+    Message,
+    ProjectSummary,
+    StreamEvent,
+)
 
 
 @dataclass(slots=True)
@@ -45,6 +54,17 @@ class Selectors:
     sidebar_link_candidates: tuple[str, ...] = (
         'nav a[href*="/c/"]',
         'a[href*="/c/"]',
+    )
+    project_link_candidates: tuple[str, ...] = (
+        'nav a[href*="/project/"]',
+        'nav a[href*="/projects/"]',
+        'a[href*="/project/"]',
+        'a[href*="/projects/"]',
+    )
+    project_conversation_candidates: tuple[str, ...] = (
+        'main a[href*="/g/"][href*="/c/"]',
+        'main a[href*="/c/"]',
+        'a[href*="/g/"][href*="/c/"]',
     )
     message_candidates: tuple[str, ...] = (
         '[data-message-author-role]',
@@ -145,11 +165,109 @@ class ChatGPTWebBackend:
         self._log(f"refresh_conversations found no sidebar selector {await self._page_summary()}")
         return []
 
-    async def open_conversation(self, remote_id: str | None) -> ConversationData:
+    async def refresh_projects(self) -> list[ProjectSummary]:
+        await self._goto_home()
+        projects = await self._extract_projects_from_sidebar()
+        if projects:
+            self._log(f"refresh_projects extracted from sidebar count={len(projects)}")
+            return projects
+        page = await self._require_page()
+        for selector in self._selectors.project_link_candidates:
+            locator = page.locator(selector)
+            try:
+                count = await locator.count()
+                if count:
+                    self._log(f"refresh_projects matched selector={selector} count={count}")
+                    projects = await self._extract_projects(locator)
+                    if projects:
+                        return projects
+            except Error:
+                continue
+        self._log(f"refresh_projects found no project selector {await self._page_summary()}")
+        return []
+
+    async def refresh_project_conversations(self, project: ProjectSummary) -> list[ConversationSummary]:
+        page = await self._require_page()
+        opened = False
+        if project.href:
+            await self._navigate(self._full_url(project.href))
+            opened = True
+            await self._wait_for_project_context(project)
+        else:
+            opened = await self._open_project_sidebar_entry(project)
+        if not opened:
+            self._log(f"refresh_project_conversations could not open project={project.remote_id} title={project.title!r}")
+            return []
+        for selector in self._selectors.project_conversation_candidates:
+            locator = page.locator(selector)
+            try:
+                count = await locator.count()
+                if count:
+                    self._log(
+                        f"refresh_project_conversations matched project selector={selector} "
+                        f"project={project.remote_id} count={count}"
+                    )
+                    conversations = await self._extract_conversations(
+                        locator,
+                        project_remote_id=project.remote_id,
+                    )
+                    if conversations:
+                        return conversations
+            except Error:
+                continue
+        for selector in self._selectors.sidebar_link_candidates:
+            locator = page.locator(selector)
+            try:
+                count = await locator.count()
+                if count:
+                    self._log(
+                        f"refresh_project_conversations matched selector={selector} "
+                        f"project={project.remote_id} count={count}"
+                    )
+                    return await self._extract_conversations(locator, project_remote_id=project.remote_id)
+            except Error:
+                continue
+        self._log(
+            f"refresh_project_conversations found no conversation selector "
+            f"project={project.remote_id} {await self._page_summary()}"
+        )
+        return []
+
+    async def _wait_for_project_context(self, project: ProjectSummary) -> None:
+        page = await self._require_page()
+        expected_path = urlparse(project.href or "").path if project.href else ""
+        for attempt in range(12):
+            current_path = urlparse(page.url).path
+            if expected_path and current_path == expected_path:
+                self._log(
+                    f"wait_for_project_context matched url project={project.remote_id} "
+                    f"attempt={attempt} path={current_path!r}"
+                )
+                return
+            try:
+                nav_text = await page.evaluate(
+                    """() => {
+                        const nav = document.querySelector('nav');
+                        return nav ? nav.innerText : '';
+                    }"""
+                )
+            except Error:
+                nav_text = ""
+            if project.title and project.title in nav_text:
+                self._log(
+                    f"wait_for_project_context matched title project={project.remote_id} "
+                    f"attempt={attempt}"
+                )
+                return
+            await asyncio.sleep(0.5)
+        self._log(f"wait_for_project_context timed out project={project.remote_id} {await self._page_summary()}")
+
+    async def open_conversation(self, remote_id: str | None, href: str | None = None) -> ConversationData:
         page = await self._require_page()
         current_remote_id = self._extract_remote_id(page.url)
-        if remote_id and current_remote_id != remote_id:
-            await self._navigate(f"{self._settings.base_url}c/{remote_id}")
+        destination = self._conversation_url(remote_id, href)
+        if remote_id and destination and page.url != destination:
+            await self._navigate(destination)
             await self._wait_for_conversation_messages(remote_id)
         elif remote_id:
             await self._wait_for_conversation_messages(remote_id)
@@ -158,13 +276,19 @@ class ChatGPTWebBackend:
         messages = await self._extract_messages()
         title = await page.title()
         self._log(f"open_conversation remote_id={remote_id} title={title!r} messages={len(messages)}")
-        summary = ConversationSummary(remote_id=remote_id, title=title or "New Chat", is_new_chat=remote_id is None)
+        summary = ConversationSummary(
+            remote_id=remote_id,
+            title=title or "New Chat",
+            is_new_chat=remote_id is None,
+            href=href,
+        )
         return ConversationData(summary=summary, messages=messages)
 
-    async def send_message(self, remote_id: str | None, prompt: str) -> list[StreamEvent]:
+    async def send_message(self, remote_id: str | None, prompt: str, href: str | None = None) -> list[StreamEvent]:
         page = await self._require_page()
-        if remote_id:
-            await self._navigate(f"{self._settings.base_url}c/{remote_id}")
+        destination = self._conversation_url(remote_id, href)
+        if remote_id and destination:
+            await self._navigate(destination)
         else:
             await self._goto_home()
         baseline_messages = await self._extract_messages()
@@ -615,19 +739,117 @@ class ChatGPTWebBackend:
         self._log(f"find_first label={label} no matches {await self._page_summary()}")
         return None
 
-    async def _extract_conversations(self, locator) -> list[ConversationSummary]:
+    async def _extract_conversations(self, locator, project_remote_id: str | None = None) -> list[ConversationSummary]:
         count = min(await locator.count(), self._settings.sync_limit)
         items: list[ConversationSummary] = []
+        seen_ids: set[str] = set()
         for index in range(count):
             entry = locator.nth(index)
             href = await entry.get_attribute("href")
             if not href:
                 continue
-            remote_id = href.rstrip("/").split("/")[-1]
+            if "/c/" not in href:
+                continue
+            remote_id = self._extract_remote_id(self._full_url(href))
+            if remote_id is None or remote_id in seen_ids:
+                continue
             title = (await entry.inner_text()).strip() or "Untitled Chat"
-            items.append(ConversationSummary(remote_id=remote_id, title=title))
+            items.append(
+                ConversationSummary(
+                    remote_id=remote_id,
+                    title=title,
+                    project_remote_id=project_remote_id,
+                    href=self._full_url(href),
+                )
+            )
+            seen_ids.add(remote_id)
         self._log(f"extracted conversations count={len(items)}")
         return items
+
+    async def _extract_projects(self, locator) -> list[ProjectSummary]:
+        count = await locator.count()
+        items: list[ProjectSummary] = []
+        seen_ids: set[str] = set()
+        for index in range(count):
+            entry = locator.nth(index)
+            href = await entry.get_attribute("href")
+            if not href:
+                continue
+            remote_id = self._extract_project_remote_id(href)
+            if remote_id is None or remote_id in seen_ids:
+                continue
+            title = (await entry.inner_text()).strip() or "Untitled Project"
+            items.append(ProjectSummary(remote_id=remote_id, title=title, href=href))
+            seen_ids.add(remote_id)
+        self._log(f"extracted projects count={len(items)}")
+        return items
+
+    async def _extract_projects_from_sidebar(self) -> list[ProjectSummary]:
+        page = await self._require_page()
+        try:
+            raw_items = await page.evaluate(
+                """() => {
+                    const nav = document.querySelector('nav');
+                    if (!nav) return [];
+                    const interactive = [...nav.querySelectorAll('a[href], button, [role="button"]')];
+                    return interactive.map((node, index) => ({
+                        index,
+                        href: node.getAttribute('href') || '',
+                        text: (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim(),
+                        aria: node.getAttribute('aria-label') || '',
+                    })).filter(item => item.text);
+                }"""
+            )
+        except Error:
+            return []
+        if not raw_items:
+            return []
+        section_headings = {
+            "new chat",
+            "chats",
+            "gpts",
+            "explore gpts",
+            "library",
+            "recents",
+            "recent",
+            "today",
+            "yesterday",
+            "settings",
+            "upgrade",
+        }
+        projects: list[ProjectSummary] = []
+        seen_ids: set[str] = set()
+        in_projects = False
+        for item in raw_items:
+            text = str(item.get("text") or "").strip()
+            href = str(item.get("href") or "").strip() or None
+            lower = text.lower()
+            if lower == "projects":
+                in_projects = True
+                continue
+            if not in_projects:
+                if href and self._extract_project_remote_id(href):
+                    remote_id = self._extract_project_remote_id(href)
+                    if remote_id and remote_id not in seen_ids:
+                        projects.append(ProjectSummary(remote_id=remote_id, title=text or "Untitled Project", href=href))
+                        seen_ids.add(remote_id)
+                continue
+            if lower in section_headings:
+                break
+            if href and "/c/" in href:
+                continue
+            if lower in {"new project", "see more", "show more"}:
+                continue
+            if not text:
+                continue
+            remote_id = self._extract_project_remote_id(href) if href else None
+            if remote_id is None:
+                remote_id = self._slugify_project_title(text)
+            if remote_id in seen_ids:
+                continue
+            projects.append(ProjectSummary(remote_id=remote_id, title=text, href=href))
+            seen_ids.add(remote_id)
+        return projects
 
     async def _extract_messages(self) -> list[Message]:
         page = await self._require_page()
@@ -672,7 +894,63 @@ class ChatGPTWebBackend:
         pieces = path.split("/")
         if len(pieces) >= 2 and pieces[0] == "c":
             return pieces[1]
+        if "c" in pieces:
+            index = pieces.index("c")
+            if len(pieces) > index + 1:
+                return pieces[index + 1]
         return None
+
+    def _conversation_url(self, remote_id: str | None, href: str | None) -> str | None:
+        if href:
+            return self._full_url(href)
+        if remote_id:
+            return f"{self._settings.base_url}c/{remote_id}"
+        return None
+
+    def _extract_project_remote_id(self, href: str) -> str | None:
+        path = urlparse(href).path.strip("/")
+        if not path:
+            return None
+        pieces = path.split("/")
+        if len(pieces) >= 2 and pieces[0] in {"project", "projects"}:
+            return pieces[1]
+        return None
+
+    def _slugify_project_title(self, title: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        return f"title:{slug or 'project'}"
+
+    async def _open_project_sidebar_entry(self, project: ProjectSummary) -> bool:
+        page = await self._require_page()
+        candidates = []
+        if project.href:
+            candidates.append(f'nav a[href="{project.href}"]')
+        title = project.title.replace("\\", "\\\\").replace('"', '\\"')
+        candidates.extend(
+            [
+                f'nav a:has-text("{title}")',
+                f'nav button:has-text("{title}")',
+                f'nav [role="button"]:has-text("{title}")',
+            ]
+        )
+        for selector in candidates:
+            locator = page.locator(selector)
+            try:
+                if await locator.count():
+                    await locator.first.click()
+                    self._log(f"open_project_sidebar_entry clicked selector={selector} title={project.title!r}")
+                    await page.wait_for_timeout(750)
+                    return True
+            except Error:
+                continue
+        return False
+
+    def _full_url(self, href: str) -> str:
+        if href.startswith("http://") or href.startswith("https://"):
+            return href
+        if href.startswith("/"):
+            return f"{self._settings.base_url.rstrip('/')}{href}"
+        return f"{self._settings.base_url}{href}"
 
     async def _page_summary(self) -> str:
         page = await self._require_page()

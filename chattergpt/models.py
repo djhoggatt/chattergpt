@@ -21,10 +21,24 @@ class ConversationSummary:
     title: str
     updated_at: str | None = None
     is_new_chat: bool = False
+    project_remote_id: str | None = None
+    href: str | None = None
 
     @property
     def key(self) -> str:
         return self.remote_id or "__new_chat__"
+
+
+@dataclass(slots=True)
+class ProjectSummary:
+    remote_id: str
+    title: str
+    href: str | None = None
+    updated_at: str | None = None
+
+    @property
+    def key(self) -> str:
+        return f"project:{self.remote_id}"
 
 
 @dataclass(slots=True)
@@ -58,9 +72,9 @@ class StreamEvent:
 
 @dataclass(slots=True)
 class SidebarItem:
-    kind: Literal["section", "browser", "conversation"]
+    kind: Literal["section", "conversation", "project", "back"]
     key: str
     label: str
     selectable: bool = True
     conversation: ConversationSummary | None = None
-    browser_name: str | None = None
+    project: ProjectSummary | None = None

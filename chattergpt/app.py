@@ -13,7 +13,7 @@ from textual.widgets import Label
 from chattergpt.backend.chatgpt_web import ChatGPTWebBackend
 from chattergpt.config import load_settings
 from chattergpt.models import BackendStatus
-from chattergpt.models import AuthState, ConversationSummary, Message, SidebarItem
+from chattergpt.models import AuthState, ConversationSummary, Message, ProjectSummary, SidebarItem
 from chattergpt.store import Store
 from chattergpt.widgets.composer import Composer, ComposerSubmitted
 from chattergpt.widgets.history import ChatHistory
@@ -48,6 +48,7 @@ class ChattergptApp(App[None]):
         self._refreshing = False
         self._selected_key = self.current_conversation.key
         self._sidebar_open_task: asyncio.Task[None] | None = None
+        self.current_project: ProjectSummary | None = None
 
     def compose(self) -> ComposeResult:
         with Container(id="sidebar"):
@@ -123,9 +124,13 @@ class ChattergptApp(App[None]):
                 status.update(self._format_backend_status(backend_status))
                 return
             conversations = await self.backend.refresh_conversations()
+            projects = await self.backend.refresh_projects()
             self.store.replace_remote_conversations(conversations)
+            self.store.replace_projects(projects)
             await self._load_cached_sidebar()
-            status.update(f"Synchronized {len(conversations)} conversations from ChatGPT.")
+            status.update(
+                f"Synchronized {len(conversations)} conversations and {len(projects)} projects from ChatGPT."
+            )
         finally:
             self._refreshing = False
 
@@ -140,10 +145,43 @@ class ChattergptApp(App[None]):
 
     async def _activate_sidebar_item(self, item: SidebarItem) -> None:
         self._selected_key = item.key
+        if item.kind == "back":
+            if self.current_project is not None:
+                self._selected_key = self.current_project.key
+            self.current_project = None
+            await self._load_cached_sidebar()
+            return
+        if item.kind == "project" and item.project is not None:
+            await self._open_project(item.project)
+            return
         if item.kind == "conversation" and item.conversation is not None:
             if self._same_conversation(item.conversation, self.current_conversation):
                 return
             await self._open_selected(item.conversation)
+
+    async def _open_project(self, project: ProjectSummary) -> None:
+        if self.current_project is not None and self.current_project.remote_id == project.remote_id:
+            return
+        self.current_project = project
+        self._selected_key = project.key
+        await self._load_cached_sidebar()
+        self.query_one("#status", Label).update(f"Loading chats for project {project.title}...")
+        self.run_worker(self._load_project_conversations(project), exclusive=True, group="project-open")
+
+    async def _load_project_conversations(self, project: ProjectSummary) -> None:
+        status = self.query_one("#status", Label)
+        try:
+            conversations = await self.backend.refresh_project_conversations(project)
+        except Exception as exc:
+            status.update(f"Failed to load project chats: {exc}")
+            return
+        for conversation in conversations:
+            conversation.project_remote_id = project.remote_id
+        self.store.replace_remote_conversations(conversations)
+        if self.current_project is None or self.current_project.remote_id != project.remote_id:
+            return
+        await self._load_cached_sidebar()
+        status.update(f"Loaded {len(conversations)} chats from project {project.title}.")
 
     async def _open_selected(self, conversation: ConversationSummary) -> None:
         if self._same_conversation(conversation, self.current_conversation):
@@ -170,7 +208,8 @@ class ChattergptApp(App[None]):
         status = self.query_one("#status", Label)
         self._opening_conversation = True
         try:
-            data = await self.backend.open_conversation(remote_id)
+            current_href = self.current_conversation.href if self.current_conversation.remote_id == remote_id else None
+            data = await self.backend.open_conversation(remote_id, href=current_href)
         except Exception as exc:
             status.update(f"Failed to open conversation: {exc}")
             return
@@ -213,9 +252,10 @@ class ChattergptApp(App[None]):
         history = self.query_one(ChatHistory)
         status = self.query_one("#status", Label)
         remote_id = self.current_conversation.remote_id
+        current_href = self.current_conversation.href
         assistant_text = ""
         try:
-            events = await self.backend.send_message(remote_id, prompt)
+            events = await self.backend.send_message(remote_id, prompt, href=current_href)
             for event in events:
                 if event.kind == "conversation" and event.remote_id:
                     self.current_conversation = ConversationSummary(
@@ -354,6 +394,11 @@ class ChattergptApp(App[None]):
         return left.is_new_chat == right.is_new_chat
 
     def _build_sidebar_items(self) -> list[SidebarItem]:
+        if self.current_project is not None:
+            return self._build_project_sidebar_items(self.current_project)
+        return self._build_root_sidebar_items()
+
+    def _build_root_sidebar_items(self) -> list[SidebarItem]:
         items: list[SidebarItem] = [SidebarItem(kind="section", key="section:chats", label="Chats", selectable=False)]
         for conversation in self.store.list_conversations():
             label = "New Chat" if conversation.is_new_chat else conversation.title
@@ -362,6 +407,34 @@ class ChattergptApp(App[None]):
                     kind="conversation",
                     key=conversation.key,
                     label=label,
+                    conversation=conversation,
+                )
+            )
+        projects = self.store.list_projects()
+        if projects:
+            items.append(SidebarItem(kind="section", key="section:projects", label="Projects", selectable=False))
+            for project in projects:
+                items.append(
+                    SidebarItem(
+                        kind="project",
+                        key=project.key,
+                        label=project.title,
+                        project=project,
+                    )
+                )
+        return items
+
+    def _build_project_sidebar_items(self, project: ProjectSummary) -> list[SidebarItem]:
+        items: list[SidebarItem] = [
+            SidebarItem(kind="back", key="back:projects", label="Back"),
+            SidebarItem(kind="section", key=f"section:{project.key}", label=project.title, selectable=False),
+        ]
+        for conversation in self.store.list_conversations(project.remote_id):
+            items.append(
+                SidebarItem(
+                    kind="conversation",
+                    key=conversation.key,
+                    label=conversation.title,
                     conversation=conversation,
                 )
             )
