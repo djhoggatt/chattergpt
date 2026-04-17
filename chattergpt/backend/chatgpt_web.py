@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -70,60 +72,37 @@ class ChatGPTWebBackend:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
-        self._attached = False
-        self._target: BrowserTarget | None = self._selected_target()
+        self._target: BrowserTarget | None = settings.browser_target
         self._launched_process: subprocess.Popen | None = None
+        self._virtual_display_process: subprocess.Popen | None = None
+        self._managed_browser_virtualized = False
+        self._managed_browser_virtual_display = ""
+        self._launch_note = ""
         self._log_path = settings.backend_log_path
 
     async def start(self) -> BackendStatus:
         try:
             self._log("backend start requested")
+            self._launch_note = ""
             self._playwright = await async_playwright().start()
-            if self._settings.backend_mode == "attach":
-                target = self._selected_target()
-                if target is None:
-                    await self.close()
-                    return BackendStatus(
-                        auth_state=AuthState.ERROR,
-                        detail="No supported Chromium-family browsers were detected for attach mode.",
-                    )
-                self._target = target
-                self._attached = True
-                self._log(f"attach mode using target={target.name} cdp_url={target.cdp_url}")
-                try:
-                    self._browser = await self._connect_or_launch_target(target)
-                except Exception as exc:
-                    self._log(f"attach failed target={target.name} error={exc!r}")
-                    await self.close()
-                    return BackendStatus(
-                        auth_state=AuthState.ERROR,
-                        detail=(
-                            f"Could not attach to {target.name} at {target.cdp_url}: {exc}\n"
-                            f"Launch command:\n{target.launch_command}"
-                        ),
-                    )
-                self._context = self._select_context(self._browser)
-                self._page = await self._select_page()
-            else:
-                launch_options = {
-                    "user_data_dir": str(self._settings.browser_profile_dir),
-                    "headless": self._settings.headless,
-                    "viewport": {"width": 1440, "height": 1200},
-                }
-                if self._settings.browser_executable_path:
-                    launch_options["executable_path"] = self._settings.browser_executable_path
-                self._context = await self._playwright.chromium.launch_persistent_context(**launch_options)
-                self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
-                self._log("launch mode started persistent context")
+            target = self._target
+            if target is None:
+                await self.close()
+                return BackendStatus(
+                    auth_state=AuthState.ERROR,
+                    detail="No supported Chromium-family browser was detected. Set CHATTERGPT_BROWSER to a browser binary.",
+                )
+            await self._launch_managed_context(target)
             await self._navigate(self._settings.base_url)
             status = await self.check_auth()
-            if self._attached and self._target is not None:
+            if self._settings.browser_executable_path:
+                if self._managed_browser_virtualized:
+                    mode_detail = f"Using managed browser in virtual display {self._managed_browser_virtual_display}."
+                else:
+                    mode_detail = "Using managed visible browser window."
+                note = f" {self._launch_note}" if self._launch_note else ""
                 status.detail = (
-                    f"{status.detail} Attached to {self._target.name} at {self._target.cdp_url}."
-                )
-            elif self._settings.browser_executable_path:
-                status.detail = (
-                    f"{status.detail} Using system browser at {self._settings.browser_executable_path}."
+                    f"{status.detail} {mode_detail} Using system browser at {self._settings.browser_executable_path}.{note}"
                 )
             return status
         except Exception as exc:
@@ -133,16 +112,23 @@ class ChatGPTWebBackend:
 
     async def close(self) -> None:
         self._log("backend close requested")
-        if self._context is not None and not self._attached:
-            await self._context.close()
         self._context = None
         self._browser = None
         self._launched_process = None
+        if self._virtual_display_process is not None and self._virtual_display_process.poll() is None:
+            self._virtual_display_process.terminate()
+            try:
+                self._virtual_display_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._virtual_display_process.kill()
+        self._virtual_display_process = None
+        self._managed_browser_virtualized = False
+        self._managed_browser_virtual_display = ""
+        self._launch_note = ""
         if self._playwright is not None:
             await self._playwright.stop()
             self._playwright = None
         self._page = None
-        self._attached = False
 
     async def refresh_conversations(self) -> list[ConversationSummary]:
         page = await self._require_page()
@@ -312,16 +298,19 @@ class ChatGPTWebBackend:
         )
 
     async def reveal_browser(self) -> BackendStatus:
+        if self._managed_browser_virtualized:
+            return BackendStatus(
+                auth_state=AuthState.AUTHENTICATED,
+                detail=(
+                    "Managed browser is running inside a virtual display. "
+                    "Restart with CHATTERGPT_DISPLAY_BROWSER=1 to inspect it."
+                ),
+                page_url=self._page.url if self._page is not None else None,
+                page_title=await self._safe_page_title() if self._page is not None else None,
+            )
         page = await self._require_page()
         await page.bring_to_front()
         return await self.check_auth()
-
-    def set_target(self, target_name: str) -> None:
-        self._settings.selected_browser_name = target_name
-        self._target = self._selected_target()
-
-    def list_targets(self) -> list[BrowserTarget]:
-        return list(self._settings.browser_targets or [])
 
     def current_remote_id(self) -> str | None:
         if self._page is None:
@@ -330,6 +319,79 @@ class ChatGPTWebBackend:
 
     async def _goto_home(self) -> None:
         await self._navigate(self._settings.base_url)
+
+    async def _launch_managed_context(self, target: BrowserTarget) -> None:
+        launch_env = dict(os.environ)
+        if self._settings.virtual_display_executable and not self._settings.display_browser:
+            display = self._start_virtual_display()
+            if display is not None:
+                launch_env["DISPLAY"] = display
+                self._managed_browser_virtualized = True
+                self._managed_browser_virtual_display = display
+            else:
+                self._managed_browser_virtualized = False
+                self._managed_browser_virtual_display = ""
+                if not self._launch_note:
+                    self._launch_note = "Virtual display was requested but unavailable, so the browser is visible."
+        self._browser = await self._connect_or_launch_target(target, env=launch_env)
+        self._context = self._select_context(self._browser)
+        self._page = await self._select_page()
+        self._log(
+            "launch mode connected to managed browser "
+            f"target={target.name} "
+            f"virtualized={self._managed_browser_virtualized} "
+            f"display={self._managed_browser_virtual_display or '(visible)'}"
+        )
+
+    def _start_virtual_display(self) -> str | None:
+        if self._virtual_display_process is not None and self._virtual_display_process.poll() is None:
+            return self._managed_browser_virtual_display or None
+        executable = self._settings.virtual_display_executable
+        if not executable:
+            self._log("virtual display requested but no virtual display executable was detected")
+            self._launch_note = "No virtual display executable was detected."
+            return None
+        display_number = self._find_available_display_number(self._settings.virtual_display_number)
+        display = f":{display_number}"
+        command = [
+            executable,
+            display,
+            "-screen",
+            "0",
+            self._settings.virtual_display_size,
+            "-nolisten",
+            "tcp",
+        ]
+        self._virtual_display_process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        for _ in range(20):
+            if self._virtual_display_process.poll() is not None:
+                self._log(f"virtual display exited immediately display={display}")
+                self._launch_note = "Virtual display failed to start."
+                self._virtual_display_process = None
+                self._managed_browser_virtual_display = ""
+                return None
+            if Path(f"/tmp/.X11-unix/X{display_number}").exists():
+                break
+            time.sleep(0.1)
+        else:
+            self._log(f"virtual display socket did not appear display={display}")
+            self._launch_note = "Virtual display did not become ready."
+            return None
+        self._managed_browser_virtual_display = display
+        self._log(f"started virtual display display={display} command={command!r}")
+        return display
+
+    def _find_available_display_number(self, start: int) -> int:
+        display = start
+        while Path(f"/tmp/.X11-unix/X{display}").exists():
+            display += 1
+        return display
 
     async def _navigate(self, url: str) -> None:
         page = await self._require_page()
@@ -408,24 +470,27 @@ class ChatGPTWebBackend:
         await page.keyboard.press("Enter")
         self._log("submit_prompt used Enter key")
 
-    async def _connect_or_launch_target(self, target: BrowserTarget) -> Browser:
+    async def _connect_or_launch_target(self, target: BrowserTarget, *, env: dict[str, str] | None = None) -> Browser:
+        first_error: Exception | None = None
         try:
             self._log(f"connect_over_cdp initial target={target.name} url={target.cdp_url}")
             return await self._playwright.chromium.connect_over_cdp(target.cdp_url)
-        except Exception as first_error:
-            if not self._settings.auto_launch_browser:
-                raise first_error
-            self._log(f"connect_over_cdp initial failed target={target.name} error={first_error!r}; launching")
-            self._launch_target(target)
-            for _ in range(30):
-                try:
-                    self._log(f"connect_over_cdp retry target={target.name}")
-                    return await self._playwright.chromium.connect_over_cdp(target.cdp_url)
-                except Exception:
-                    await asyncio.sleep(0.5)
+        except Exception as exc:
+            first_error = exc
+            self._log(f"connect_over_cdp initial failed target={target.name} error={exc!r}; launching")
+        self._launch_target(target, env=env)
+        for _ in range(30):
+            try:
+                self._log(f"connect_over_cdp retry target={target.name}")
+                return await self._playwright.chromium.connect_over_cdp(target.cdp_url)
+            except Exception as exc:
+                first_error = first_error or exc
+                await asyncio.sleep(0.5)
+        if first_error is not None:
             raise first_error
+        raise RuntimeError(f"Unable to connect to launched browser target {target.name}.")
 
-    def _launch_target(self, target: BrowserTarget) -> None:
+    def _launch_target(self, target: BrowserTarget, env: dict[str, str] | None = None) -> None:
         if self._launched_process is not None and self._launched_process.poll() is None:
             return
         command = [
@@ -434,22 +499,22 @@ class ChatGPTWebBackend:
             f"--user-data-dir={target.profile_dir}",
             self._settings.base_url,
         ]
+        launch_env = env or os.environ.copy()
         self._launched_process = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            env=launch_env,
         )
-        self._log(f"launched browser target={target.name} pid={self._launched_process.pid} command={command!r}")
-
-    def _selected_target(self) -> BrowserTarget | None:
-        targets = self._settings.browser_targets or []
-        if self._settings.selected_browser_name:
-            for target in targets:
-                if target.name == self._settings.selected_browser_name:
-                    return target
-        return targets[0] if targets else None
+        self._log(
+            "launched browser "
+            f"target={target.name} "
+            f"pid={self._launched_process.pid} "
+            f"display={launch_env.get('DISPLAY', '(default)')} "
+            f"command={command!r}"
+        )
 
     def _select_context(self, browser: Browser) -> BrowserContext:
         if browser.contexts:
@@ -472,13 +537,32 @@ class ChatGPTWebBackend:
         page = await self._require_page()
         challenge_markers = (
             'text="Verify you are human"',
+            'text="Just a moment..."',
+            'text="Checking your browser"',
             'iframe[title*="challenge"]',
             '[data-translate="challenge"]',
         )
+        page_title = await self._safe_page_title()
+        if page_title in {"Just a moment...", "Attention Required! | Cloudflare"}:
+            self._log(f"auth_state challenge by title title={page_title!r}")
+            if self._managed_browser_virtualized:
+                return (
+                    AuthState.UNKNOWN,
+                    "Challenge page detected inside the virtual display. Restart with CHATTERGPT_DISPLAY_BROWSER=1, complete the check, then run normally again.",
+                )
+            return (
+                AuthState.UNKNOWN,
+                "Challenge page detected. Complete the verification in the controlled browser window.",
+            )
         for selector in challenge_markers:
             try:
                 if await page.locator(selector).count():
                     self._log(f"auth_state challenge marker matched selector={selector}")
+                    if self._managed_browser_virtualized:
+                        return (
+                            AuthState.UNKNOWN,
+                            "Challenge page detected inside the virtual display. Restart with CHATTERGPT_DISPLAY_BROWSER=1, complete the check, then run normally again.",
+                        )
                     return (
                         AuthState.UNKNOWN,
                         f"Challenge page detected. Complete the verification in the browser window. Matched selector: {selector}",

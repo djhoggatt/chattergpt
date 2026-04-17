@@ -47,7 +47,7 @@ class ChattergptApp(App[None]):
         self._polling_auth = False
         self._refreshing = False
         self._selected_key = self.current_conversation.key
-        self._browser_targets = self.backend.list_targets()
+        self._sidebar_open_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         with Container(id="sidebar"):
@@ -65,16 +65,21 @@ class ChattergptApp(App[None]):
         self.run_worker(self._startup_backend(), exclusive=True, group="startup")
 
     async def on_unmount(self) -> None:
+        if self._sidebar_open_task is not None:
+            self._sidebar_open_task.cancel()
         self.store.close()
         await self.backend.close()
 
     async def action_sidebar_up(self) -> None:
         self.query_one(Sidebar).move_selection(-1)
+        self._schedule_sidebar_open()
 
     async def action_sidebar_down(self) -> None:
         self.query_one(Sidebar).move_selection(1)
+        self._schedule_sidebar_open()
 
     async def action_sidebar_open(self) -> None:
+        self._cancel_sidebar_open()
         item = self.query_one(Sidebar).current()
         if item is not None:
             await self._activate_sidebar_item(item)
@@ -94,9 +99,14 @@ class ChattergptApp(App[None]):
             await self._refresh_from_backend()
         elif self.auth_state == AuthState.LOGIN_REQUIRED:
             history = self.query_one(ChatHistory)
-            history.set_messages(
-                [Message(role="system", content="Login required. Complete login in the controlled browser window, then press F5.")]
-            )
+            if self.settings.display_browser or self.settings.virtual_display_executable is None:
+                login_message = "Login required. Complete login in the controlled browser window, then press F5."
+            else:
+                login_message = (
+                    "Login required. Restart with CHATTERGPT_DISPLAY_BROWSER=1, complete login in the managed browser "
+                    "window, then run normally again."
+                )
+            history.set_messages([Message(role="system", content=login_message)])
         elif self.auth_state == AuthState.ERROR:
             history = self.query_one(ChatHistory)
             history.set_messages([Message(role="system", content=self._startup_help_text())])
@@ -125,6 +135,7 @@ class ChattergptApp(App[None]):
 
     @on(SidebarItemSelected)
     async def handle_sidebar_selected(self, event: SidebarItemSelected) -> None:
+        self._cancel_sidebar_open()
         await self._activate_sidebar_item(event.item)
 
     async def _activate_sidebar_item(self, item: SidebarItem) -> None:
@@ -274,22 +285,39 @@ class ChattergptApp(App[None]):
 
     def _format_backend_status(self, backend_status: BackendStatus) -> str:
         location = backend_status.page_title or backend_status.page_url or "unknown page"
-        target = self._settings_target_name()
+        target = self.settings.browser_target.name if self.settings.browser_target is not None else "unknown"
         return f"{backend_status.detail} [{location}] [browser: {target}]"
 
-    def _settings_target_name(self) -> str:
-        return self.settings.selected_browser_name or "unknown"
-
     def _startup_help_text(self) -> str:
-        target = next((target for target in self._browser_targets if target.name == self._settings_target_name()), None)
+        target = self.settings.browser_target
         if target is None:
-            return "No attachable Chromium-family browsers detected."
-        if self.settings.auto_launch_browser:
-            return (
-                f"Chattergpt will try to launch {target.name} automatically with a dedicated profile.\n\n"
-                f"Launch command:\n{target.launch_command}"
-            )
-        return f"Start {target.name} yourself with remote debugging enabled, then press F5.\n\nExample:\n{target.launch_command}"
+            return "No Chromium-family browser was detected. Set CHATTERGPT_BROWSER to a browser binary."
+        if self.settings.display_browser or self.settings.virtual_display_executable is None:
+            return f"Chattergpt is using a managed visible browser based on {target.name}."
+        return (
+            f"Chattergpt is using a managed browser in a virtual display based on {target.name}.\n\n"
+            "If login or challenges require a visible window, restart with CHATTERGPT_DISPLAY_BROWSER=1."
+        )
+
+    def _schedule_sidebar_open(self) -> None:
+        self._cancel_sidebar_open()
+        self._sidebar_open_task = asyncio.create_task(self._open_sidebar_after_delay())
+
+    def _cancel_sidebar_open(self) -> None:
+        if self._sidebar_open_task is not None:
+            self._sidebar_open_task.cancel()
+            self._sidebar_open_task = None
+
+    async def _open_sidebar_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(0.2)
+            item = self.query_one(Sidebar).current()
+            if item is not None:
+                await self._activate_sidebar_item(item)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._sidebar_open_task = None
 
     async def _reconcile_current_conversation(self, remote_id: str, minimum_messages: int) -> None:
         for _ in range(8):
