@@ -38,9 +38,10 @@ class ChatHistory(RichLog):
         self.clear()
         if not self._messages:
             self.write(Panel(Text("Start a new conversation."), title="Empty Chat", border_style="dim"))
-            return
-        for message in self._messages:
-            self.write(self._panel_for_message(message.role, message.content))
+        else:
+            for message in self._messages:
+                self.write(self._panel_for_message(message.role, message.content))
+        self.call_after_refresh(self.scroll_end, animate=False)
 
     def _panel_for_message(self, role: str, content: str) -> Panel:
         title = "You" if role == "user" else ("System" if role == "system" else "ChatGPT")

@@ -298,6 +298,9 @@ class ChattergptApp(App[None]):
                 continue
             if self.current_conversation.remote_id != remote_id:
                 return
+            if self.backend.current_remote_id() != remote_id:
+                await asyncio.sleep(1.0)
+                continue
             try:
                 data = await self.backend.open_conversation(remote_id)
             except Exception:

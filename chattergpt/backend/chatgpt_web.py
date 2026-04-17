@@ -34,6 +34,12 @@ class Selectors:
         'button[aria-label^="Send"]',
         'form button[type="submit"]',
     )
+    stop_button_candidates: tuple[str, ...] = (
+        'button[data-testid="stop-button"]',
+        'button[aria-label^="Stop"]',
+        'button:has-text("Stop generating")',
+        'button:has-text("Stop")',
+    )
     sidebar_link_candidates: tuple[str, ...] = (
         'nav a[href*="/c/"]',
         'a[href*="/c/"]',
@@ -189,7 +195,7 @@ class ChatGPTWebBackend:
         assistant_text = ""
         conversation_announced = False
         stable_rounds = 0
-        for _ in range(160):
+        for attempt in range(240):
             await asyncio.sleep(self._settings.poll_interval_seconds)
             known_remote_id = known_remote_id or self._extract_remote_id(page.url)
             if known_remote_id and not conversation_announced:
@@ -204,36 +210,35 @@ class ChatGPTWebBackend:
                     )
                 )
             current_messages = await self._extract_messages()
-            if len(current_messages) > len(baseline_messages):
-                latest = current_messages[-1]
-                if latest.role == "assistant":
-                    delta = latest.content[len(assistant_text) :]
-                    if delta:
-                        assistant_text = latest.content
-                        stable_rounds = 0
-                        events.append(StreamEvent(kind="assistant_delta", text=delta, remote_id=known_remote_id))
-                    else:
-                        stable_rounds += 1
-            elif current_messages:
-                latest = current_messages[-1]
-                if latest.role == "assistant":
-                    delta = latest.content[len(assistant_text) :]
-                    if delta:
-                        assistant_text = latest.content
-                        stable_rounds = 0
-                        events.append(StreamEvent(kind="assistant_delta", text=delta, remote_id=known_remote_id))
-                    elif assistant_text:
-                        stable_rounds += 1
-            if assistant_text and stable_rounds >= 3:
+            latest_assistant = self._latest_new_assistant_text(baseline_messages, current_messages)
+            if latest_assistant and latest_assistant != assistant_text:
+                assistant_text = latest_assistant
+                stable_rounds = 0
+                self._log(
+                    f"send_message captured assistant candidate remote_id={known_remote_id} assistant_chars={len(assistant_text)}"
+                )
+            elif assistant_text:
+                stable_rounds += 1
+            generation_in_progress = await self._is_generation_in_progress(stable_rounds)
+            if assistant_text and not generation_in_progress:
                 self._log(
                     f"send_message completed remote_id={known_remote_id} assistant_chars={len(assistant_text)}"
                 )
                 events.append(StreamEvent(kind="assistant_done", text=assistant_text, remote_id=known_remote_id))
                 return events
-            if _ % 10 == 0:
+            if attempt % 10 == 0:
                 self._log(
-                    f"send_message polling remote_id={known_remote_id} current_messages={len(current_messages)} assistant_chars={len(assistant_text)}"
+                    "send_message polling "
+                    f"remote_id={known_remote_id} "
+                    f"current_messages={len(current_messages)} "
+                    f"assistant_chars={len(assistant_text)} "
+                    f"stable_rounds={stable_rounds} "
+                    f"generating={generation_in_progress}"
                 )
+        final_messages = await self._extract_messages()
+        final_assistant = self._latest_new_assistant_text(baseline_messages, final_messages)
+        if final_assistant:
+            assistant_text = final_assistant
         if known_remote_id and not conversation_announced:
             page_title = await self._safe_page_title()
             self._log(f"send_message late conversation remote_id={known_remote_id} title={page_title!r}")
@@ -257,6 +262,39 @@ class ChatGPTWebBackend:
                 )
             )
         return events
+
+    async def _is_generation_in_progress(self, stable_rounds: int = 0) -> bool:
+        page = await self._require_page()
+        for selector in self._selectors.stop_button_candidates:
+            locator = page.locator(selector)
+            try:
+                if await locator.count():
+                    self._log(f"generation_in_progress matched stop selector={selector}")
+                    return True
+            except Error:
+                continue
+        send_button = await self._find_first("send_button_state", self._selectors.send_button_candidates)
+        if send_button is None:
+            if stable_rounds >= 3:
+                self._log("generation_in_progress treating missing send button as complete after stable rounds")
+                return False
+            return True
+        try:
+            disabled = bool(await send_button.evaluate("(node) => !!node.disabled"))
+        except Error:
+            disabled = False
+        return disabled
+
+    def _latest_new_assistant_text(self, baseline_messages: list[Message], current_messages: list[Message]) -> str:
+        baseline_count = len(baseline_messages)
+        if len(current_messages) > baseline_count:
+            candidates = current_messages[baseline_count:]
+        else:
+            candidates = current_messages
+        for message in reversed(candidates):
+            if message.role == "assistant" and message.content.strip():
+                return message.content.strip()
+        return ""
 
     async def check_auth(self) -> BackendStatus:
         page = await self._require_page()
@@ -284,6 +322,11 @@ class ChatGPTWebBackend:
 
     def list_targets(self) -> list[BrowserTarget]:
         return list(self._settings.browser_targets or [])
+
+    def current_remote_id(self) -> str | None:
+        if self._page is None:
+            return None
+        return self._extract_remote_id(self._page.url)
 
     async def _goto_home(self) -> None:
         await self._navigate(self._settings.base_url)
