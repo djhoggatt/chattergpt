@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -132,9 +133,32 @@ class ChatGPTWebBackend:
 
     async def close(self) -> None:
         self._log("backend close requested")
+        browser = self._browser
+        launched_process = self._launched_process
         self._context = None
         self._browser = None
         self._launched_process = None
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception as exc:
+                self._log(f"browser close failed error={exc!r}")
+        if launched_process is not None and launched_process.poll() is None:
+            try:
+                os.killpg(launched_process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                self._log(f"browser process terminate failed pid={launched_process.pid} error={exc!r}")
+            try:
+                launched_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(launched_process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as exc:
+                    self._log(f"browser process kill failed pid={launched_process.pid} error={exc!r}")
         if self._virtual_display_process is not None and self._virtual_display_process.poll() is None:
             self._virtual_display_process.terminate()
             try:
